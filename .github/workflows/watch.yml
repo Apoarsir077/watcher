@@ -20,7 +20,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
@@ -54,7 +54,7 @@ jobs:
         if: ${{ github.event.inputs.test_mail != 'true' }}
         run: python slot_watcher_lite.py
         env:
-          RUN_MINUTES: "10"        # 每次运行持续检查约 10 分钟
+          RUN_MINUTES: "30"        # 每次运行持续检查约 10 分钟
           INTERVAL_SECONDS: "180"  # 每次检查之间间隔约 3 分钟（180 秒）
           EL_ID: ${{ secrets.EL_ID }}
           EL_PW: ${{ secrets.EL_PW }}
