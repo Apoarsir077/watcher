@@ -8,7 +8,8 @@ e-license 空位监控 · 轻量版（不开浏览器，只发网络请求）
 用法:
   pip install requests beautifulsoup4
   python slot_watcher_lite.py              检查一次（GitHub Actions 就是这样定时调用的）
-  python slot_watcher_lite.py --loop       循环检查，约每 5 分钟一次（在自己电脑上试用）
+  python slot_watcher_lite.py --loop       一直循环检查（默认约每 3 分钟一次，在自己电脑上试用）
+  RUN_MINUTES=10 python slot_watcher_lite.py   这次运行持续检查约 10 分钟后退出（GitHub Actions 用）
   python slot_watcher_lite.py --testmail   只发一封测试邮件
   python slot_watcher_lite.py --parse 某个页面.html   离线解析一个保存下来的格子页，用来排查
 
@@ -34,7 +35,7 @@ DEFAULT_LOGIN_URL = "https://www.e-license.jp/el26/?abc=NVWLSxxtyBY%2BbrGQYS%2B1
 
 STATE_FILE = "state.json"        # 记录已通知过的空位，避免重复发邮件
 OUT_DIR = "output"               # 出错时保存页面，方便排查（只在本地用，别上传到公开的地方）
-LOOP_INTERVAL = (240, 360)       # --loop 模式下两次检查的间隔（秒）
+DEFAULT_INTERVAL = 180           # 两次检查的间隔（秒），可用环境变量 INTERVAL_SECONDS 覆盖
 CAR_KEYWORD = "所内"             # 页面上的「車種」必须包含这个词，否则不通知
 TIMEOUT = 30
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -278,6 +279,29 @@ def check_once():
     save_seen(current)       # 已经消失的空位会被移出，下次再出现会重新通知
 
 
+def run_loop(interval, deadline=None, max_fails=5):
+    """循环检查。deadline 为 None 表示一直跑；否则到点后退出。连续失败 max_fails 次返回 1。"""
+    fails = 0
+    while True:
+        try:
+            check_once()
+            fails = 0
+        except TransientError as e:
+            log(f"暂时失败，稍后重试：{e}")
+        except FatalError as e:
+            fails += 1
+            log(f"出错（{fails}/{max_fails}）：{e}")
+        except Exception as e:
+            fails += 1
+            log(f"未预料的错误（{fails}/{max_fails}）：{type(e).__name__}: {e}")
+        if fails >= max_fails:
+            return 1
+        wait = random.uniform(interval * 0.85, interval * 1.15)
+        if deadline is not None and time.time() + wait >= deadline:
+            return 0
+        time.sleep(wait)
+
+
 def main():
     argv = sys.argv[1:]
 
@@ -297,23 +321,16 @@ def main():
         log(str(e))
         return 1
 
+    interval = float(os.environ.get("INTERVAL_SECONDS", "") or DEFAULT_INTERVAL)
+    run_minutes = float(os.environ.get("RUN_MINUTES", "") or 0)
+
     if "--loop" in argv:
-        fails = 0
         log("循环模式，Ctrl+C 停止")
-        while True:
-            try:
-                check_once()
-                fails = 0
-            except TransientError as e:
-                log(f"暂时失败，稍后重试：{e}")
-            except FatalError as e:
-                fails += 1
-                log(f"出错（{fails}/5）：{e}")
-                if fails >= 5:
-                    return 1
-            except Exception as e:
-                log(f"未预料的错误：{type(e).__name__}: {e}")
-            time.sleep(random.uniform(*LOOP_INTERVAL))
+        return run_loop(interval, None, 5)
+
+    if run_minutes > 0:
+        log(f"本次运行持续约 {run_minutes:g} 分钟，每约 {interval:g} 秒检查一次")
+        return run_loop(interval, time.time() + run_minutes * 60, 3)
 
     try:
         check_once()
