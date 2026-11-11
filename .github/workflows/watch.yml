@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "*/5 * * * *"   # 每 5 分钟一次（GitHub 可能延迟几分钟）
   workflow_dispatch:         # 允许在网页上手动点「Run workflow」来测试
+    inputs:
+      test_mail:
+        description: "只发一封测试邮件（不检查空位）"
+        type: boolean
+        default: false
 
 concurrency:
   group: slot-watch
@@ -23,8 +28,18 @@ jobs:
       - name: Install dependencies
         run: pip install requests beautifulsoup4
 
+      # 手动运行时勾选 test_mail，只发一封测试邮件，用来确认邮箱密码设对了
+      - name: Send test mail
+        if: ${{ github.event.inputs.test_mail == 'true' }}
+        run: python slot_watcher_lite.py --testmail
+        env:
+          MAIL_USER: ${{ secrets.MAIL_USER }}
+          MAIL_PASS: ${{ secrets.MAIL_PASS }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+
       # 记住已经通知过的空位，避免每 5 分钟重复发同一封邮件
       - name: Restore state
+        if: ${{ github.event.inputs.test_mail != 'true' }}
         uses: actions/cache@v4
         with:
           path: state.json
@@ -33,6 +48,7 @@ jobs:
             seen-
 
       - name: Check slots
+        if: ${{ github.event.inputs.test_mail != 'true' }}
         run: python slot_watcher_lite.py
         env:
           EL_ID: ${{ secrets.EL_ID }}
