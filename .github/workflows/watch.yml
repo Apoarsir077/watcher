@@ -2,7 +2,10 @@ name: slot-watch
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # 每 5 分钟一次（GitHub 可能延迟几分钟）
+    # 每 5 分钟触发一次；每次运行会持续检查约 10 分钟，同一时间只有一个在跑，前一个结束后下一个接上，
+    # 所以实际检查间隔约 3 分钟（由下面的 INTERVAL_SECONDS 决定）。
+    # 如果只想在日本时间 7:00～23:00 运行，把下面这行换成：  - cron: "*/5 22-23,0-14 * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:         # 允许在网页上手动点「Run workflow」来测试
     inputs:
       test_mail:
@@ -17,7 +20,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -51,6 +54,8 @@ jobs:
         if: ${{ github.event.inputs.test_mail != 'true' }}
         run: python slot_watcher_lite.py
         env:
+          RUN_MINUTES: "10"        # 每次运行持续检查约 10 分钟
+          INTERVAL_SECONDS: "180"  # 每次检查之间间隔约 3 分钟（180 秒）
           EL_ID: ${{ secrets.EL_ID }}
           EL_PW: ${{ secrets.EL_PW }}
           MAIL_USER: ${{ secrets.MAIL_USER }}
