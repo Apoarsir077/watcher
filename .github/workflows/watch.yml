@@ -21,6 +21,8 @@ jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
@@ -54,8 +56,9 @@ jobs:
         if: ${{ github.event.inputs.test_mail != 'true' }}
         run: python slot_watcher_lite.py
         env:
-          RUN_MINUTES: "30"        # 每次运行持续检查约 10 分钟
+          RUN_MINUTES: "30"        # 每次运行持续检查约 30 分钟
           INTERVAL_SECONDS: "180"  # 每次检查之间间隔约 3 分钟（180 秒）
+          CAR_KEYWORD: ""          # 车种检查：留空 = 不检查，跟着网站自动切换的车种走；想限定某个车种可填 "AT1" 之类
           EL_ID: ${{ secrets.EL_ID }}
           EL_PW: ${{ secrets.EL_PW }}
           MAIL_USER: ${{ secrets.MAIL_USER }}
