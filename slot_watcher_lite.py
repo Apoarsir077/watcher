@@ -24,6 +24,7 @@ import re
 import smtplib
 import sys
 import time
+import unicodedata
 from datetime import datetime
 from email.message import EmailMessage
 from urllib.parse import urljoin
@@ -36,7 +37,11 @@ DEFAULT_LOGIN_URL = "https://www.e-license.jp/el26/?abc=NVWLSxxtyBY%2BbrGQYS%2B1
 STATE_FILE = "state.json"        # 记录已通知过的空位，避免重复发邮件
 OUT_DIR = "output"               # 出错时保存页面，方便排查（只在本地用，别上传到公开的地方）
 DEFAULT_INTERVAL = 180           # 两次检查的间隔（秒），可用环境变量 INTERVAL_SECONDS 覆盖
-CAR_KEYWORD = "所内"             # 页面上的「車種」必须包含这个词，否则不通知
+DEFAULT_MAX_BOOKINGS = 0         # 已预约（黄色）格子达到这个数量就自动停止监控；0=不自动停（默认）。环境变量 MAX_BOOKINGS 可改
+STOP_FLAG = "stop.flag"          # 达到上限时写出这个文件，通知 GitHub Actions 关闭定时任务
+STOP = "stop"
+# 环境变量 CAR_KEYWORD：页面上的「車種」必须包含这个词（全角半角、大小写不分），否则报错停止通知。
+# 例如 "AT1" 或 "所内"；留空 = 不检查车种。
 TIMEOUT = 30
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
@@ -213,36 +218,45 @@ def parse_grid(html):
     car_el = soup.select_one("div.carChange")
     car = re.sub(r"^車種\s*[:：]\s*", "", clean(car_el.get_text(" "))) if car_el else ""
 
-    res = {"total": 0, "yellow": 0, "green": [], "car": car}
+    res = {"total": 0, "yellow": 0, "yellow_list": [], "green": [], "car": car}
     for i, tr in enumerate(table.select("tr.date")):
         for j, td in enumerate(tr.find_all("td", recursive=False)):
             res["total"] += 1
             cls = td.get("class") or []
+            label = (f"{dates[i] if i < len(dates) else '第%d行' % (i + 1)}  "
+                     f"{heads[j] if j < len(heads) else '第%d列' % (j + 1)}")
             if "status1" in cls:
-                res["green"].append(
-                    f"{dates[i] if i < len(dates) else '第%d行' % (i + 1)}  "
-                    f"{heads[j] if j < len(heads) else '第%d列' % (j + 1)}"
-                )
+                res["green"].append(label)
             elif "status3" in cls:
                 res["yellow"] += 1
+                name = clean(td.get_text(" "))
+                res["yellow_list"].append(label + (f"（{name}）" if name else ""))
     return res
 
 
 # ---------------------------------------------------------------- 主流程
-def load_seen():
+def load_state():
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
-            return set(json.load(f).get("seen", []))
+            return json.load(f)
     except Exception:
-        return set()
+        return {}
 
 
-def save_seen(seen):
+def save_state(state):
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump({"seen": sorted(seen)}, f, ensure_ascii=False)
+            json.dump(state, f, ensure_ascii=False)
     except Exception as e:
         log(f"保存状态失败：{e}")
+
+
+def write_stop_flag(msg):
+    try:
+        with open(STOP_FLAG, "w", encoding="utf-8") as f:
+            f.write(msg)
+    except Exception:
+        pass
 
 
 def check_once():
@@ -258,25 +272,61 @@ def check_once():
     finally:
         logout(s, html)
 
-    if CAR_KEYWORD and res["car"] and CAR_KEYWORD not in res["car"]:
-        raise FatalError(f"当前车种不是「{CAR_KEYWORD}」：{res['car']}，请先在网站上切换车种")
+    def norm(t):   # 全角转半角、转大写、去空格：「ＡＴ１」->「AT1」
+        return re.sub(r"\s+", "", unicodedata.normalize("NFKC", t)).upper()
 
-    seen = load_seen()
+    kw = os.environ.get("CAR_KEYWORD", "").strip()
+    if kw and res["car"] and norm(kw) not in norm(res["car"]):
+        raise FatalError(f"当前车种是「{res['car']}」，不含「{kw}」。"
+                         "如果你现在要约的就是这个车种，把 watch.yml 里的 CAR_KEYWORD 改成对应的词（或留空不检查）")
+
+    state = load_state()
+    if state.get("car") != res["car"]:      # 车种变了（例如从所内换成 AT1），旧的记录作废
+        if state.get("car") is not None:
+            log(f"车种变化：{state.get('car')} -> {res['car']}，重置已通知记录")
+        state = {"car": res["car"]}
+    seen = set(state.get("seen", []))
     current = set(res["green"])
     new = current - seen
     log(f"读到格子 {res['total']} 个，黄色 {res['yellow']} 个，"
         f"绿色 {len(current)} 个，新出现 {len(new)} 个")
 
+    def lines(items):
+        return "\n".join(f"  ・{x}" for x in items) if items else "  （无）"
+
+    booked = f"你目前已预约的课（黄色，共 {res['yellow']} 个）：\n{lines(res['yellow_list'])}"
+
+    # 已预约（黄色）的课达到上限 -> 通知一次并停止监控
+    limit = int(os.environ.get("MAX_BOOKINGS", "") or DEFAULT_MAX_BOOKINGS)
+    if limit > 0 and res["yellow"] >= limit:
+        log(f"已有 {res['yellow']} 个黄色格子（已预约），达到上限 {limit}，停止监控")
+        if not state.get("stop_notified"):
+            sent = send_mail(
+                f"【监控已停止】已预约满 {res['yellow']} 节课",
+                f"已预约的课达到上限 {limit}，监控已自动停止。\n\n{booked}\n\n"
+                "如果之后取消了课、想继续监控：在 GitHub 仓库的 Actions → slot-watch 里点 Enable workflow。",
+            )
+            if sent:
+                state["stop_notified"] = True
+        state["seen"] = sorted(current)
+        save_state(state)
+        return STOP
+    state["stop_notified"] = False       # 低于上限了，复位
+
     if new:
-        sent = send_mail(
-            "【有空位】预约网站出现可预约时间段",
-            "出现了可预约的格子（车种：" + (res["car"] or "?") + "）：\n\n"
-            + "\n".join(sorted(new))
-            + f"\n\n马上去抢：{CFG['login_url']}",
-        )
-        if not sent:          # 没发出去就不记为已通知，下次继续提醒
-            return
-    save_seen(current)       # 已经消失的空位会被移出，下次再出现会重新通知
+        new_list = [g for g in res["green"] if g in new]          # 保持页面上的先后顺序
+        others = [g for g in res["green"] if g not in new]        # 之前已通知过、仍然可约的
+        body = (f"出现了 {len(new_list)} 个新的可预约（绿色）格子（车种：{res['car'] or '?'}）：\n"
+                f"{lines(new_list)}\n")
+        if others:
+            body += f"\n另外仍可预约的（之前已通知过）：\n{lines(others)}\n"
+        body += f"\n{booked}\n\n马上去抢：{CFG['login_url']}"
+        subject = "【有空位】" + new_list[0] + (f" 等 {len(new_list)} 个" if len(new_list) > 1 else "")
+        if not send_mail(subject, body):   # 没发出去就不记为已通知，下次继续提醒
+            return None
+    state["seen"] = sorted(current)   # 已经消失的空位会被移出，下次再出现会重新通知
+    save_state(state)
+    return None
 
 
 def run_loop(interval, deadline=None, max_fails=5):
@@ -284,7 +334,9 @@ def run_loop(interval, deadline=None, max_fails=5):
     fails = 0
     while True:
         try:
-            check_once()
+            if check_once() == STOP:
+                write_stop_flag("booking limit reached")
+                return 0
             fails = 0
         except TransientError as e:
             log(f"暂时失败，稍后重试：{e}")
@@ -321,6 +373,9 @@ def main():
         log(str(e))
         return 1
 
+    if os.path.exists(STOP_FLAG):
+        os.remove(STOP_FLAG)
+
     interval = float(os.environ.get("INTERVAL_SECONDS", "") or DEFAULT_INTERVAL)
     run_minutes = float(os.environ.get("RUN_MINUTES", "") or 0)
 
@@ -333,7 +388,8 @@ def main():
         return run_loop(interval, time.time() + run_minutes * 60, 3)
 
     try:
-        check_once()
+        if check_once() == STOP:
+            write_stop_flag("booking limit reached")
         return 0
     except TransientError as e:
         log(f"暂时失败，下次再试：{e}")
