@@ -58,7 +58,7 @@ jobs:
         env:
           RUN_MINUTES: "30"        # 每次运行持续检查约 30 分钟
           INTERVAL_SECONDS: "180"  # 每次检查之间间隔约 3 分钟（180 秒）
-          CAR_KEYWORD: ""          # 车种检查：留空 = 不检查，跟着网站自动切换的车种走；想限定某个车种可填 "AT1" 之类
+          CAR_MODELS: "326,101"    # 要监控的车种代码：326=AT1，101=MT所内，105=M1総合。多个用逗号隔开
           EL_ID: ${{ secrets.EL_ID }}
           EL_PW: ${{ secrets.EL_PW }}
           MAIL_USER: ${{ secrets.MAIL_USER }}
