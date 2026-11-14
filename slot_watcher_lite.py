@@ -2,25 +2,20 @@
 """
 e-license 空位监控 · 轻量版（不开浏览器，只发网络请求）
 
-每次检查 = 登录 -> 依次读取要监控的各个车种的格子页 -> 找「予約可能」(绿色) 的格子
-          -> 有新空位就发邮件 -> 退出登录。只通知，不自动预约。
+每次运行 = 登录 -> 读取格子页 -> 找「予約可能」(绿色) 的格子 -> 有新空位就发邮件 -> 退出登录。
+只通知，不自动预约。
 
 用法:
   pip install requests beautifulsoup4
-  python slot_watcher_lite.py              检查一次
+  python slot_watcher_lite.py              检查一次（GitHub Actions 就是这样定时调用的）
   python slot_watcher_lite.py --loop       一直循环检查（默认约每 3 分钟一次，在自己电脑上试用）
-  RUN_MINUTES=30 python slot_watcher_lite.py   这次运行持续检查约 30 分钟后退出（GitHub Actions 用）
+  RUN_MINUTES=10 python slot_watcher_lite.py   这次运行持续检查约 10 分钟后退出（GitHub Actions 用）
   python slot_watcher_lite.py --testmail   只发一封测试邮件
   python slot_watcher_lite.py --parse 某个页面.html   离线解析一个保存下来的格子页，用来排查
 
-环境变量:
-  EL_ID, EL_PW, MAIL_USER, MAIL_PASS, MAIL_TO   账号和邮箱（本地运行时缺哪个会提示输入）
-  CAR_MODELS        要监控的车种代码，逗号分隔，例如 "326,101"（326=AT1, 101=MT所内, 105=M1総合）。
-                    留空 = 只看登录后默认显示的那一个车种
-  RUN_MINUTES       每次运行持续检查多少分钟（0 或不设 = 只检查一次）
-  INTERVAL_SECONDS  两次检查的间隔秒数（默认 180）
-  MAX_BOOKINGS      已预约（黄色）数量达到多少就自动停止（默认 0 = 不自动停止）
-  CAR_KEYWORD       只在没设 CAR_MODELS 时有用：页面車種必须包含这个词，否则报错
+账号、密码、邮箱都从环境变量读取（代码里不放密码）:
+  EL_ID, EL_PW, MAIL_USER, MAIL_PASS, MAIL_TO
+本地运行时缺哪个就会提示你输入。
 """
 import json
 import os
@@ -32,7 +27,7 @@ import time
 import unicodedata
 from datetime import datetime
 from email.message import EmailMessage
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -41,10 +36,12 @@ DEFAULT_LOGIN_URL = "https://www.e-license.jp/el26/?abc=NVWLSxxtyBY%2BbrGQYS%2B1
 
 STATE_FILE = "state.json"        # 记录已通知过的空位，避免重复发邮件
 OUT_DIR = "output"               # 出错时保存页面，方便排查（只在本地用，别上传到公开的地方）
-DEFAULT_INTERVAL = 180           # 两次检查的间隔（秒）
-DEFAULT_MAX_BOOKINGS = 0         # 0 = 不自动停止
-STOP_FLAG = "stop.flag"
+DEFAULT_INTERVAL = 180           # 两次检查的间隔（秒），可用环境变量 INTERVAL_SECONDS 覆盖
+DEFAULT_MAX_BOOKINGS = 0         # 已预约（黄色）格子达到这个数量就自动停止监控；0=不自动停（默认）。环境变量 MAX_BOOKINGS 可改
+STOP_FLAG = "stop.flag"          # 达到上限时写出这个文件，通知 GitHub Actions 关闭定时任务
 STOP = "stop"
+# 环境变量 CAR_KEYWORD：页面上的「車種」必须包含这个词（全角半角、大小写不分），否则报错停止通知。
+# 例如 "AT1" 或 "所内"；留空 = 不检查车种。
 TIMEOUT = 30
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
@@ -62,11 +59,6 @@ class FatalError(Exception):
 
 def log(msg):
     print(f"[{datetime.now():%m-%d %H:%M:%S}] {msg}", flush=True)
-
-
-def nk(t):
-    """全角转半角、合并空白：「ＭＴ所内」->「MT所内」"""
-    return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", t or "")).strip()
 
 
 def load_config(need_login=True, need_mail=False):
@@ -130,14 +122,6 @@ def dump(name, text):
         pass
 
 
-def describe(r):
-    """页面摘要（不含个人信息），写进错误信息里，方便在 GitHub 日志里排查。"""
-    soup = BeautifulSoup(r.text, "html.parser")
-    forms = [f.get("id") for f in soup.find_all("form") if f.get("id")]
-    return (f"HTTP {r.status_code}，路径 {urlparse(r.url).path}，"
-            f"表单 {forms}，含格子表 {'yoyakuTable' in r.text}")
-
-
 def check_site_error(text):
     if "EC05" in text or "システムメンテナンス" in text or "アクセス集中" in text:
         raise TransientError("网站返回了维护/访问集中提示（EC05）")
@@ -173,7 +157,8 @@ def login(s):
     data = {i["name"]: i.get("value", "") for i in form.find_all("input") if i.get("name")}
     data["studentId"] = CFG["id"]
     data["password"] = CFG["pw"]
-    return http(s, "POST", action, data=data, headers={"Referer": r.url})
+    r2 = http(s, "POST", action, data=data, headers={"Referer": r.url})
+    return r2
 
 
 def get_grid_html(s, r):
@@ -209,69 +194,7 @@ def logout(s, html):
         pass
 
 
-# ---------------------------------------------------------------- 切换车种
-def page_var(html, name):
-    m = re.search(name + r"\s*=\s*'([^']+)'", html)
-    return m.group(1) if m else None
-
-
-def form_data(soup, form_id):
-    form = soup.select_one(f"form#{form_id}")
-    if form is None:
-        return None
-    return {i["name"]: i.get("value", "") for i in form.find_all("input") if i.get("name")}
-
-
-def grid_model(html):
-    el = BeautifulSoup(html, "html.parser").select_one("form#p03AForm input[name=carModelCd]")
-    return el.get("value") if el is not None else None
-
-
-def switch_car(s, html, model):
-    """模拟点「車種変更」再点某个车种：格子页 -> 车种选择页 -> 该车种的格子页。"""
-    soup = BeautifulSoup(html, "html.parser")
-    url_a = page_var(html, "carChangeUrl")
-    data_a = form_data(soup, "p03AForm")
-    if not url_a or data_a is None:
-        dump("grid_no_carchange.html", html)
-        raise FatalError("格子页里找不到「車種変更」的入口，页面结构可能变了")
-
-    r1 = http(s, "POST", urljoin(CFG["login_url"], url_a), data=data_a,
-              headers={"Referer": CFG["login_url"]})
-    soup1 = BeautifulSoup(r1.text, "html.parser")
-    data_b = form_data(soup1, "p03BForm")
-    options = [b.get("data-model") for b in soup1.select("button.carChange[data-model]")]
-    url_b = page_var(r1.text, "carChangeUrl")
-    if data_b is None or not url_b:
-        dump("carchange_step1.html", r1.text)
-        raise FatalError(f"点「車種変更」后没有出现选择车种的页面（{describe(r1)}）")
-    if model not in options:
-        raise FatalError(f"车种代码 {model} 不在可选列表 {options} 里")
-
-    data_b["carModelCd"] = model
-    r2 = http(s, "POST", urljoin(CFG["login_url"], url_b), data=data_b,
-              headers={"Referer": CFG["login_url"]})
-    if "yoyakuTable" not in r2.text:
-        dump("carchange_step2.html", r2.text)
-        raise FatalError(f"选择车种 {model} 后没有回到格子页（{describe(r2)}）")
-    got = grid_model(r2.text)
-    if got != model:
-        raise FatalError(f"切换后页面的车种代码是 {got}，不是 {model}")
-    return r2.text
-
-
 # ---------------------------------------------------------------- 解析格子
-def when_key(date_label, period, first_month):
-    """把「11月15日」+ 第几限 变成可比较的先后顺序（跨年时月份顺延 12）。"""
-    m = re.match(r"(\d+)月(\d+)日", date_label)
-    if not m:
-        return None
-    mo, d = int(m.group(1)), int(m.group(2))
-    if first_month and mo < first_month:
-        mo += 12
-    return (mo, d, period)
-
-
 def parse_grid(html):
     """
     页面结构：左边 #ginou-scroll-day 放日期；右边 table.yoyakuTable 放格子，
@@ -283,58 +206,32 @@ def parse_grid(html):
     if table is None:
         return None
 
-    dates = [nk(td.get_text(" ")) for td in soup.select("#ginou-scroll-day tr.date td.view")]
-    heads, periods = [], []
+    def clean(t):
+        return re.sub(r"\s+", " ", t.replace("\xa0", " ")).strip()
+
+    dates = [clean(td.get_text(" ")) for td in soup.select("#ginou-scroll-day tr.date td.view")]
+    heads = []
     for td in table.select("tr.carender td"):
-        t = nk(td.get_text(" "))
+        t = clean(td.get_text(" "))
         m = re.match(r"(\d+)\s+(\d{1,2}:\d{2})", t)
         heads.append(f"第{m.group(1)}限 {m.group(2)}" if m else t)
-        periods.append(int(m.group(1)) if m else 0)
-    first_month = None
-    if dates:
-        m = re.match(r"(\d+)月", dates[0])
-        first_month = int(m.group(1)) if m else None
-
     car_el = soup.select_one("div.carChange")
-    car = re.sub(r"^車種\s*[:：]\s*", "", nk(car_el.get_text(" "))) if car_el else ""
-    model_el = soup.select_one("form#p03AForm input[name=carModelCd]")
+    car = re.sub(r"^車種\s*[:：]\s*", "", clean(car_el.get_text(" "))) if car_el else ""
 
-    res = {"model": model_el.get("value") if model_el is not None else None,
-           "car": car, "total": 0, "green": [], "yellow": []}
+    res = {"total": 0, "yellow": 0, "yellow_list": [], "green": [], "car": car}
     for i, tr in enumerate(table.select("tr.date")):
         for j, td in enumerate(tr.find_all("td", recursive=False)):
             res["total"] += 1
             cls = td.get("class") or []
-            date = dates[i] if i < len(dates) else f"第{i + 1}行"
-            label = f"{date}  {heads[j] if j < len(heads) else '第%d列' % (j + 1)}"
-            when = when_key(date, periods[j] if j < len(periods) else 0, first_month)
+            label = (f"{dates[i] if i < len(dates) else '第%d行' % (i + 1)}  "
+                     f"{heads[j] if j < len(heads) else '第%d列' % (j + 1)}")
             if "status1" in cls:
-                res["green"].append({"label": label, "when": when})
+                res["green"].append(label)
             elif "status3" in cls:
-                res["yellow"].append({"label": label, "when": when, "name": nk(td.get_text(" "))})
+                res["yellow"] += 1
+                name = clean(td.get_text(" "))
+                res["yellow_list"].append(label + (f"（{name}）" if name else ""))
     return res
-
-
-def wanted_models():
-    return [m for m in re.split(r"[,\s]+", os.environ.get("CAR_MODELS", "")) if m]
-
-
-def collect_grids(s, html):
-    """依次读取要监控的各个车种的格子页。返回 (各车种解析结果, 最后停留的页面)。"""
-    models = wanted_models()
-    if models:
-        cur = grid_model(html)
-        models = sorted(models, key=lambda m: m != cur)      # 当前显示的车种先处理，少切换一次
-    grids = []
-    for m in (models or [None]):
-        if m is not None and grid_model(html) != m:
-            html = switch_car(s, html, m)
-        res = parse_grid(html)
-        if res is None or res["total"] == 0:
-            dump("no_cells.html", html)
-            raise FatalError("读到的格子数为 0，页面结构可能变了")
-        grids.append(res)
-    return grids, html
 
 
 # ---------------------------------------------------------------- 主流程
@@ -362,60 +259,51 @@ def write_stop_flag(msg):
         pass
 
 
-def lines(items):
-    return "\n".join(f"  ・{x}" for x in items) if items else "  （无）"
-
-
 def check_once():
     s = new_session()
     html = ""
     try:
         r = login(s)
         html = get_grid_html(s, r)
-        grids, html = collect_grids(s, html)
+        res = parse_grid(html)
+        if res is None or res["total"] == 0:
+            dump("no_cells.html", html)
+            raise FatalError("读到的格子数为 0，页面结构可能变了")
     finally:
         logout(s, html)
 
+    def norm(t):   # 全角转半角、转大写、去空格：「ＡＴ１」->「AT1」
+        return re.sub(r"\s+", "", unicodedata.normalize("NFKC", t)).upper()
+
     kw = os.environ.get("CAR_KEYWORD", "").strip()
-    if kw and not wanted_models() and grids[0]["car"] and nk(kw).upper() not in nk(grids[0]["car"]).upper():
-        raise FatalError(f"当前车种是「{grids[0]['car']}」，不含「{kw}」。"
-                         "如果你现在要约的就是这个车种，把 CAR_KEYWORD 改成对应的词（或留空不检查）")
+    if kw and res["car"] and norm(kw) not in norm(res["car"]):
+        raise FatalError(f"当前车种是「{res['car']}」，不含「{kw}」。"
+                         "如果你现在要约的就是这个车种，把 watch.yml 里的 CAR_KEYWORD 改成对应的词（或留空不检查）")
 
     state = load_state()
+    if state.get("car") != res["car"]:      # 车种变了（例如从所内换成 AT1），旧的记录作废
+        if state.get("car") is not None:
+            log(f"车种变化：{state.get('car')} -> {res['car']}，重置已通知记录")
+        state = {"car": res["car"]}
     seen = set(state.get("seen", []))
-
-    # 所有绿色格子；key = 车种代码|日期时段
-    greens = []
-    for g in grids:
-        for c in g["green"]:
-            greens.append({"key": f"{g['model']}|{c['label']}", "car": g["car"] or str(g["model"]),
-                           "label": c["label"], "when": c["when"]})
-    current = {x["key"] for x in greens}
+    current = set(res["green"])
     new = current - seen
+    log(f"读到格子 {res['total']} 个，黄色 {res['yellow']} 个，"
+        f"绿色 {len(current)} 个，新出现 {len(new)} 个")
 
-    # 已预约（黄色）格子，各车种页面里重复出现的只算一次
-    booked, dup = [], set()
-    for g in grids:
-        for c in g["yellow"]:
-            k = (c["label"], c["name"])
-            if k not in dup:
-                dup.add(k)
-                booked.append(c)
-    booked.sort(key=lambda c: c["when"] or (0, 0, 0))
-    booked_block = f"你目前已预约的课（黄色，共 {len(booked)} 个）：\n" + lines(
-        [c["label"] + (f"（{c['name']}）" if c["name"] else "") for c in booked])
+    def lines(items):
+        return "\n".join(f"  ・{x}" for x in items) if items else "  （无）"
 
-    log(f"读到格子 {sum(g['total'] for g in grids)} 个（{'、'.join(g['car'] for g in grids)}），"
-        f"黄色 {len(booked)} 个，绿色 {len(current)} 个，新出现 {len(new)} 个")
+    booked = f"你目前已预约的课（黄色，共 {res['yellow']} 个）：\n{lines(res['yellow_list'])}"
 
-    # 已预约数量达到上限 -> 通知一次并停止监控（默认关闭）
+    # 已预约（黄色）的课达到上限 -> 通知一次并停止监控
     limit = int(os.environ.get("MAX_BOOKINGS", "") or DEFAULT_MAX_BOOKINGS)
-    if limit > 0 and len(booked) >= limit:
-        log(f"已有 {len(booked)} 个已预约格子，达到上限 {limit}，停止监控")
+    if limit > 0 and res["yellow"] >= limit:
+        log(f"已有 {res['yellow']} 个黄色格子（已预约），达到上限 {limit}，停止监控")
         if not state.get("stop_notified"):
             sent = send_mail(
-                f"【监控已停止】已预约满 {len(booked)} 节课",
-                f"已预约的课达到上限 {limit}，监控已自动停止。\n\n{booked_block}\n\n"
+                f"【监控已停止】已预约满 {res['yellow']} 节课",
+                f"已预约的课达到上限 {limit}，监控已自动停止。\n\n{booked}\n\n"
                 "如果之后取消了课、想继续监控：在 GitHub 仓库的 Actions → slot-watch 里点 Enable workflow。",
             )
             if sent:
@@ -423,51 +311,20 @@ def check_once():
         state["seen"] = sorted(current)
         save_state(state)
         return STOP
-    state["stop_notified"] = False
+    state["stop_notified"] = False       # 低于上限了，复位
 
     if new:
-        # 按日期时段合并：同一个时段哪些车种能约
-        by_label = {}
-        for x in greens:
-            d = by_label.setdefault(x["label"], {"when": x["when"], "types": []})
-            d["types"].append((x["car"], x["key"] in new))
-        order = lambda lb: by_label[lb]["when"] or (99, 0, 0)
-        new_labels = sorted((lb for lb, d in by_label.items() if any(n for _, n in d["types"])), key=order)
-        old_labels = sorted((lb for lb in by_label if lb not in new_labels), key=order)
-
-        # 已约的 MT所内 里最早的一节：有更早的 MT所内 空位就特别标出
-        mt_booked = [c for c in booked if "MT所内" in c["name"] and c["when"]]
-        first_mt = min(mt_booked, key=lambda c: c["when"]) if mt_booked else None
-
-        def describe_slot(lb):
-            d = by_label[lb]
-            types = " / ".join(c + ("（新）" if n else "") for c, n in d["types"])
-            text = f"{lb}  可约：{types}"
-            earlier = (first_mt is not None and d["when"] is not None and d["when"] < first_mt["when"]
-                       and any("MT所内" in c for c, _ in d["types"]))
-            if earlier:
-                text += f"\n      ⭐ MT所内 早于你已约的 MT所内（{first_mt['label']}）"
-            return text, earlier
-
-        new_lines, flagged_labels = [], []
-        for lb in new_labels:
-            text, earlier = describe_slot(lb)
-            new_lines.append(text)
-            if earlier:
-                flagged_labels.append(lb)
-        old_lines = [describe_slot(lb)[0] for lb in old_labels]
-
-        body = f"出现了 {len(new_labels)} 个新的可预约（绿色）时段：\n{lines(new_lines)}\n"
-        if old_lines:
-            body += f"\n另外仍可预约的（之前已通知过）：\n{lines(old_lines)}\n"
-        body += f"\n{booked_block}\n\n马上去抢：{CFG['login_url']}"
-        head = flagged_labels[0] if flagged_labels else new_labels[0]     # 有更早的 MT 时，标题先写它
-        head_types = "/".join(c for c, _ in by_label[head]["types"])
-        subject = ("【有更早的MT】" if flagged_labels else "【有空位】") + f"{head}（{head_types}）" \
-            + (f"等 {len(new_labels)} 个" if len(new_labels) > 1 else "")
-        if not send_mail(subject, body):     # 没发出去就不记为已通知，下次继续提醒
+        new_list = [g for g in res["green"] if g in new]          # 保持页面上的先后顺序
+        others = [g for g in res["green"] if g not in new]        # 之前已通知过、仍然可约的
+        body = (f"出现了 {len(new_list)} 个新的可预约（绿色）格子（车种：{res['car'] or '?'}）：\n"
+                f"{lines(new_list)}\n")
+        if others:
+            body += f"\n另外仍可预约的（之前已通知过）：\n{lines(others)}\n"
+        body += f"\n{booked}\n\n马上去抢：{CFG['login_url']}"
+        subject = "【有空位】" + new_list[0] + (f" 等 {len(new_list)} 个" if len(new_list) > 1 else "")
+        if not send_mail(subject, body):   # 没发出去就不记为已通知，下次继续提醒
             return None
-    state["seen"] = sorted(current)           # 已经消失的空位会被移出，下次再出现会重新通知
+    state["seen"] = sorted(current)   # 已经消失的空位会被移出，下次再出现会重新通知
     save_state(state)
     return None
 
